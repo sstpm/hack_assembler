@@ -12,6 +12,15 @@
     2. Add the ability to handle symbols like variable names and jump labels
         - SymbolTable module that tracks symbols and labels with their memory addresses.
 */
+use structopt::StructOpt;
+#[derive(Debug, StructOpt)]
+// StructOpt crate for command line argument parsing (only the path of input file for now).
+struct Cli {
+    #[structopt(parse(from_os_str))]
+    path: std::path::PathBuf,
+}
+
 fn main() {
-    println!("Hello, world!");
+    let args = Cli::from_args();
+    println!("{:?}", &args);
 }
