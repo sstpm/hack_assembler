@@ -3,10 +3,10 @@ use std::{fs::File, io::Write, path::PathBuf};
 /* A minimal assembler for the Hack computer from Nand2Tetris.
     Takes an input file "abc.asm" in the symbolic Hack machine language and writes the corrosponding binary
     to "abc.hack"
-    Implementation details and course: 
+    Implementation details and course:
     https://www.coursera.org/learn/build-a-computer?s
-    https://www.nand2tetris.org/project06 
-    
+    https://www.nand2tetris.org/project06
+
    Project to be built in sections:
     1. Basic assembler that can translate files that do not use symbols
         - Parser module that breaks input file into pieces
@@ -37,6 +37,133 @@ use structopt::StructOpt;
 struct Cli {
     #[structopt(parse(from_os_str))]
     path: std::path::PathBuf,
+}
+
+#[derive(Debug)]
+enum CommandKind {
+    ACommand,
+    CCommand,
+    LCommand,
+}
+#[derive(Debug)]
+struct ParsedLine {
+    // The "parts" of an instruction. CommandKind is either A, C, or L(abel).
+    // Depending on the CommandKind, Dest, Comp, and Jump are either Some(value) or None
+    // Examples:
+    // @100
+    // command_type: A_Command, symbol: Some("100"), dest: None, Comp: None, Jump: None
+    // D = M + 1;JEQ
+    // command_type: C_Command, symbol: None, dest: Some("D"), comp: Some("M + 1"), jump: Some("JEQ")
+    // (ORANGE)
+    // comamand_type: L_Command, symbol: Some("ORANGE"), ... : None
+    command_type: CommandKind,
+    symbol: Option<String>,
+    dest: Option<String>,
+    comp: Option<String>,
+    jump: Option<String>,
+}
+
+fn parse_line(line: String) -> ParsedLine {
+    // Assumes the line has been preprocessed already. That means all comments and whitespace have been removed and the
+    // line is not a comment. Therefore, everything to parse is a valid Hack Assembly Language command of some form.
+
+    // NOTE: instead of replacing the ; with a space and later splitting by whitespace, should we "look ahead" at the
+    // whole string, see if it contains one of "=+-" and then break the words based on what we know must be before and
+    // after those operators? Similarily for if it contains a ";" character?
+    let mut ct = CommandKind::ACommand;
+    let mut sym: Option<String> = None;
+    let mut des: Option<String> = None;
+    let mut temp_comp: String = "".to_string(); // Our "builder" for comp as it may have multiple parts.
+    let mut com: Option<String> = None;
+    let mut jmp: Option<String> = None;
+
+    let line_chars = line.chars();
+    for char in line_chars {
+        if char == '@' {
+            // A instruction, take everything until EOL into the vector.
+            ct = CommandKind::ACommand;
+            sym = Some(line.chars().skip(1).collect::<String>());
+            break; // we're done with this line.
+        } else {
+            ct = CommandKind::CCommand;
+            if char == '=' {
+                // There's an assignment of some for, ether ABC = B or AZY = B OPERATOR C
+                let pos_of_eq = line.chars().position(|x| x == '=').unwrap();
+                des = Some(line.chars().take(pos_of_eq).collect::<String>()); // Collect up to the = sign.
+                &temp_comp.push(line.chars().nth(pos_of_eq + 1).unwrap());
+            } else if char == '+' || char == '&' || char == '|' {
+                // '-' has to be handled in its own case as it could be a unary operator.
+                if line.contains("=") {
+                    // The character is an operator and has two arguments, but the first argument was found above.
+                    let pos_of_op = line
+                        .chars()
+                        .position(|x| x == '+' || x == '&' || x == '|')
+                        .unwrap();
+                    &temp_comp.push_str( line.chars().skip(pos_of_op).take(2).collect::<String>().as_str());
+                } else {
+                    // There's no destination but we still have some operation going on, eg D+M
+                    // In this case, we won't have handled the first part of the comparison yet.
+                    let pos_of_op = line
+                        .chars()
+                        .position(|x| x == '+' || x == '&' || x == '|')
+                        .unwrap();
+                    &temp_comp.push_str( line.chars().skip(pos_of_op - 1).take(3).collect::<String>().as_str());
+                }
+            } else if char == '-' || char == '!' {
+                // -X, !X, D=-X, D=!X, D=M-X, M-X
+                // - Could be a unary or binary operator, so we must check.
+                let pos_of_op = line.chars().position(|x| x == '-' || x == '!').unwrap();
+                if pos_of_op != 0 && char == '-' {
+                    // Could still be unary but we have a destination
+                    if line.chars().nth(pos_of_op - 1).unwrap() == '=' {
+                        // Unary (char after '=' will be caught by = case)
+                        &temp_comp.push(line.chars().nth(pos_of_op + 1).unwrap());
+                    } else {
+                        // Binary
+                        if line.contains("=") {
+                            // Don't capture the character after "=" again.
+                            &temp_comp.push_str( line.chars().skip(pos_of_op).take(2).collect::<String>().as_str());
+                        } else {
+                            &temp_comp.push_str(line.chars().skip(pos_of_op - 1).take(3).collect::<String>().as_str());
+                        }
+                    }
+                } else if pos_of_op == 0 {
+                    // We're at the start and are - or !
+                    &temp_comp.push_str(line.chars().take(2).collect::<String>().as_str());
+                } else if char == '!' {
+                    // We're a ! instruction and not at the beginning, eg D=!M; the '!' will be caught by '=' case.
+                    &temp_comp.push(line.chars().nth(pos_of_op + 1).unwrap());
+                }
+            } else if char == ';' {
+                // Character represents a JMP instruction is to follow
+                if line.contains("=") {
+                    // We'll have parsed the destination and the comp already; just take care of jump.
+                    let i = line.chars().position(|x| x == ';').unwrap();
+                    jmp = Some(line.chars().skip(i+1).take(3).collect::<String>());
+                } else {
+                    // There is no destination, so we may or may not have parsed the comp.
+                    if line.contains(|x| x == '+' || x == '-' || x == '&' || x == '|') {
+                        // We'll have parsed the operation and operator. Just parse the Jump.
+                        let i = line.chars().position(|x| x == ';').unwrap();
+                        jmp = Some(line.chars().skip(i+1).take(3).collect::<String>());
+                    } else {
+                        // There's no destination, and no operation; comp is just a register or memory.
+                        // In this case, we need to store the comparison register as well as process the jump.
+                        let i = line.chars().position(|x| x == ';').unwrap();
+                        let com = line.chars().nth(i - 1).unwrap();
+                        temp_comp.push(com);
+                        jmp = Some(line.chars().skip(i+1).take(3).collect::<String>());
+                    }
+                }
+            }
+        }
+    }
+    if !temp_comp.is_empty() {
+        com = Some(temp_comp.to_string());
+    }
+    ParsedLine {command_type: ct, symbol: sym, dest: des, comp: com, jump: jmp}
+    // Should we have five temp variables here that we set depending on the word in the line?
+    // After that, we create the ParsedLine from those variables?
 }
 
 /// Return the contents of the supplied file as a String, or panic.
@@ -73,4 +200,14 @@ fn main() {
         Ok(_) => (),
         Err(e) => panic!("Failed to write output to file: {}", e),
     };
+    // D = M + 1;JEQ
+    let test_command: ParsedLine = ParsedLine {
+        command_type: CommandKind::CCommand,
+        symbol: None,
+        dest: Some(String::from("D")),
+        comp: Some(String::from("M+1")),
+        jump: Some(String::from("JEQ")),
+    };
+    println!("{:?}", &test_command);
+    parse_line(String::from("@ALPHA"));
 }
