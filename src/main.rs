@@ -10,7 +10,24 @@ use std::{fs::File, io::Write, path::PathBuf};
    Project to be built in sections:
     1. Basic assembler that can translate files that do not use symbols
         - Parser module that breaks input file into pieces
-        - Code module that translates pieces into "binary instructoins"
+            - Use structs/enums to collect the different commands that could be created?
+                enum CommandKind {
+                    A_Command
+                    C_Command
+                    L_Command // psuedo instruction for labels
+                }
+                struct ParsedLine {
+                    has_more_commands: bool, // maybe not needed, depends on implimentation
+                    command_type: CommandKind,
+                    symbol: String
+                    ...
+                }
+            - Split each line into commponent pieces, then translate each line into a ParsedLine
+        - Code module that translates pieces into "binary instructions"
+            - Go through each ParsedLine and translate the various fields into their binary parts
+                - Should ParsedLine only have fields that can be translated then?
+            - Create the final string of 0s and 1s for each line
+            - Write each completed string to the output file
     2. Add the ability to handle symbols like variable names and jump labels
         - SymbolTable module that tracks symbols and labels with their memory addresses.
 */
