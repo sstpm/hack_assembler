@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{fs::File, io::Write, path::PathBuf, todo};
 
 /* A minimal assembler for the Hack computer from Nand2Tetris.
     Takes an input file "abc.asm" in the symbolic Hack machine language and writes the corrosponding binary
@@ -39,11 +39,12 @@ struct Cli {
     path: std::path::PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum CommandKind {
     ACommand,
     CCommand,
     LCommand,
+    ICommand, // An invalid command, returned upon encountering a line that is not an instruction. Ignored completely.
 }
 #[derive(Debug)]
 struct ParsedLine {
@@ -63,13 +64,11 @@ struct ParsedLine {
     jump: Option<String>,
 }
 
+
 fn parse_line(line: String) -> ParsedLine {
     // Assumes the line has been preprocessed already. That means all comments and whitespace have been removed and the
     // line is not a comment. Therefore, everything to parse is a valid Hack Assembly Language command of some form.
 
-    // NOTE: instead of replacing the ; with a space and later splitting by whitespace, should we "look ahead" at the
-    // whole string, see if it contains one of "=+-" and then break the words based on what we know must be before and
-    // after those operators? Similarily for if it contains a ";" character?
     let mut ct = CommandKind::ACommand;
     let mut sym: Option<String> = None;
     let mut des: Option<String> = None;
@@ -162,8 +161,6 @@ fn parse_line(line: String) -> ParsedLine {
         com = Some(temp_comp.to_string());
     }
     ParsedLine {command_type: ct, symbol: sym, dest: des, comp: com, jump: jmp}
-    // Should we have five temp variables here that we set depending on the word in the line?
-    // After that, we create the ParsedLine from those variables?
 }
 
 /// Return the contents of the supplied file as a String, or panic.
@@ -172,6 +169,51 @@ fn get_file_contents(asm_file: &PathBuf) -> String {
         Ok(r) => r,
         Err(e) => panic!("Couldn't read from file! Error: {}", e),
     }
+}
+
+fn preprocess_line(line: String) -> Option<String> {
+    // Strip comments, whitespaces, and spaces between words from each line.
+    /* Lines can be comments, empty, an instruction or label, or a combo of an instruction and comment.
+    Examples:
+    // File: add.asm
+    // adds 100 to whatever's at register 300 and stores it at register 100
+    @300
+    D = M
+    @100
+    M = D + A
+
+    The above should become:
+    @300
+    D=M
+    @100
+    M=D+A
+     */
+    let line_trimmed = line.trim();
+    if line_trimmed.contains("//") {
+        // We have a comment somewhere
+        if line_trimmed.starts_with("//") {
+            None
+        } else {
+            let comment_start_index = line_trimmed.chars().position(|x| x == '/').unwrap();
+            let line_nocomment = line_trimmed.chars().take(comment_start_index - 1).collect::<String>();
+            Some(line_nocomment.split_whitespace().collect::<String>())
+        }
+    } else {
+        let potential_instruction = line.split_whitespace().collect::<String>();
+        if potential_instruction.is_empty() {
+            None
+        } else {
+            Some(potential_instruction)
+        }
+    }
+}
+
+fn setup_for_writing(translated_line: String) {
+    unimplemented!();
+}
+
+fn translate(instruction: ParsedLine) -> String {
+    todo!();
 }
 
 /// Write the supplied string to the file "filename".
@@ -196,18 +238,22 @@ fn main() {
     };
     output_filename.push_str(".hack");
 
-    match write_binary_to_file(output_filename, contents) {
+    match write_binary_to_file(output_filename, contents.to_owned()) {
         Ok(_) => (),
         Err(e) => panic!("Failed to write output to file: {}", e),
     };
-    // D = M + 1;JEQ
-    let test_command: ParsedLine = ParsedLine {
-        command_type: CommandKind::CCommand,
-        symbol: None,
-        dest: Some(String::from("D")),
-        comp: Some(String::from("M+1")),
-        jump: Some(String::from("JEQ")),
-    };
-    println!("{:?}", &test_command);
-    parse_line(String::from("@ALPHA"));
+
+    for line in contents.lines() {
+        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
+        let parsed_line = match preprocess_line(line.to_string()) {
+                Some(instr) => parse_line(instr),
+                None => ParsedLine {command_type: CommandKind::ICommand, dest: None, symbol: None, comp: None, jump: None},
+        };
+       if parsed_line.command_type != CommandKind::ICommand {
+            // We've got a valid instruction, so translate it and send it to the buffer to be written.
+            // This "buffer" might be a long String with a bunch of \n in it, or it may actually be a WriteBuf
+            // setup_for_writing(translate(parsed_line));
+            println!("{:?}", &parsed_line);
+        }
+    }
 }
