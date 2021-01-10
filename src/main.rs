@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::Write, path::PathBuf, todo};
+use std::{collections::HashMap, fs::File, io::Write, path::PathBuf};
 use structopt::StructOpt;
 
 /* A minimal assembler for the Hack computer from Nand2Tetris.
@@ -7,30 +7,6 @@ use structopt::StructOpt;
     Implementation details and course:
     https://www.coursera.org/learn/build-a-computer?s
     https://www.nand2tetris.org/project06
-
-   Project to be built in sections:
-    1. Basic assembler that can translate files that do not use symbols
-        - Parser module that breaks input file into pieces
-            - Use structs/enums to collect the different commands that could be created?
-                enum CommandKind {
-                    A_Command
-                    C_Command
-                    L_Command // psuedo instruction for labels
-                }
-                struct ParsedLine {
-                    has_more_commands: bool, // maybe not needed, depends on implimentation
-                    command_type: CommandKind,
-                    symbol: String
-                    ...
-                }
-            - Split each line into commponent pieces, then translate each line into a ParsedLine
-        - Code module that translates pieces into "binary instructions"
-            - Go through each ParsedLine and translate the various fields into their binary parts
-                - Should ParsedLine only have fields that can be translated then?
-            - Create the final string of 0s and 1s for each line
-            - Write each completed string to the output file
-    2. Add the ability to handle symbols like variable names and jump labels
-        - SymbolTable module that tracks symbols and labels with their memory addresses.
 */
 #[derive(Debug, StructOpt)]
 // StructOpt crate for command line argument parsing (only the path of input file for now).
@@ -39,14 +15,14 @@ struct Cli {
     path: std::path::PathBuf,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum CommandKind {
     ACommand,
     CCommand,
     LCommand,
     ICommand, // An invalid command, returned upon encountering a line that is not an instruction. Ignored completely.
 }
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct ParsedLine {
     // The "parts" of an instruction. CommandKind is either A, C, or L(abel).
     // Depending on the CommandKind, Dest, Comp, and Jump are either Some(value) or None
@@ -62,9 +38,10 @@ struct ParsedLine {
     dest: Option<String>,
     comp: Option<String>,
     jump: Option<String>,
+    line_number: isize,
 }
 
-fn parse_line(line: String) -> ParsedLine {
+fn parse_line(line: String, line_number: isize) -> ParsedLine {
     // Assumes the line has been preprocessed already. That means all comments and whitespace have been removed and the
     // line is not a comment. Therefore, everything to parse is a valid Hack Assembly Language command of some form.
 
@@ -79,13 +56,31 @@ fn parse_line(line: String) -> ParsedLine {
     for char in line_chars {
         if char == '@' {
             // A instruction, take everything until EOL into the vector.
-            ct = CommandKind::ACommand;
-            sym = Some(line.chars().skip(1).collect::<String>());
-            break; // we're done with this line.
+            if line.chars().nth(1).unwrap().is_numeric() {
+                // We're an a instruction with a valid number, not a label.
+                ct = CommandKind::ACommand;
+                sym = Some(line.chars().skip(1).collect::<String>());
+                break; // we're done with this line.
+            } else {
+                // We a label for a variable ala @dog
+                ct = CommandKind::ACommand;
+                sym = Some(line.chars().skip(1).collect::<String>());
+                break;
+            }
+        } else if char == '(' {
+            // We're a nice LOOP label of form (XXX); take just the XXX
+            ct = CommandKind::LCommand;
+            sym = Some(
+                line.chars()
+                    .skip(1)
+                    .take_while(|x| x != &')')
+                    .collect::<String>(),
+            );
+            break;
         } else {
             ct = CommandKind::CCommand;
             if char == '=' {
-                // There's an assignment of some for, ether ABC = B or AZY = B OPERATOR C
+                // There's an assignment of some form
                 let pos_of_eq = line.chars().position(|x| x == '=').unwrap();
                 des = Some(line.chars().take(pos_of_eq).collect::<String>()); // Collect up to the = sign.
                 &temp_comp.push(line.chars().nth(pos_of_eq + 1).unwrap());
@@ -121,7 +116,7 @@ fn parse_line(line: String) -> ParsedLine {
                 }
             } else if char == '-' || char == '!' {
                 // -X, !X, D=-X, D=!X, D=M-X, M-X
-                // - Could be a unary or binary operator, so we must check.
+                // '-' Could be a unary or binary operator, so we must check.
                 let pos_of_op = line.chars().position(|x| x == '-' || x == '!').unwrap();
                 if pos_of_op != 0 && char == '-' {
                     // Could still be unary but we have a destination
@@ -183,12 +178,14 @@ fn parse_line(line: String) -> ParsedLine {
     if !temp_comp.is_empty() {
         com = Some(temp_comp.to_string());
     }
+
     ParsedLine {
         command_type: ct,
         symbol: sym,
         dest: des,
         comp: com,
         jump: jmp,
+        line_number: line_number,
     }
 }
 
@@ -240,24 +237,16 @@ fn preprocess_line(line: String) -> Option<String> {
     }
 }
 
-fn translate(instruction: ParsedLine) -> String {
+fn translate(instruction: ParsedLine, symbol_table: HashMap<Option<String>, String>) -> String {
     /* Translate the parsed content into their corrosponding binary instructions.
     Each piece of ParsedLine (except LCommands, which are special) has one and only one binary representation.
     A instructions are just translated into the binary representation of their symbol, with a leading 0 eg:
         @2 --> 0000000000000010
-    LCommands have a non-number value as their symbol and require consulting a symbol table we populate at some point.
+    LCommands have a non-number value as their symbol and require consulting a symbol table we populated earlier.
         @dog --> | dog | 16 | --> 0000000000010000
     C instructions have multiple parts, one per field with three leading 1s:
         D=A+1;JMP ->  111accccccdddjjj where acccccc are determined by the comp, ddd by dest, and jjj by jump.
-        ddd and jjj are 1->1 mapping of code -> bits, but
-        acccccc can have different comps lead to the same binary value with the only difference being the a-bit
-        However, we should still be able to store each individual comp as a key in a hash map between binary values:
-        !M -> 1110001
-        !A -> 0110001
-        which are examples of instructions that differ only in the a-bit.
     */
-    // Rust doesn't have a hash literal, so we have to collect them from something else. These don't work with `const`
-    // because they use non-const functions, so here they are.
     let dest_map: HashMap<Option<String>, &str> = [
         (None, "000"),
         (Some("M".to_string()), "001"),
@@ -321,16 +310,33 @@ fn translate(instruction: ParsedLine) -> String {
     .collect();
 
     if instruction.command_type == CommandKind::ACommand {
-        let addr_as_binstr = format!("{:b}", instruction.symbol.unwrap().parse::<u16>().unwrap());
-        let mut final_addr_binstr = addr_as_binstr.to_owned();
-        // Pad the ouput with enough zeros to "become" a 16-bit word.
-        for _ in 0..(16 - addr_as_binstr.len()) {
-            final_addr_binstr.insert(0, '0');
+        if instruction
+            .symbol
+            .to_owned()
+            .unwrap()
+            .chars()
+            .nth(0)
+            .unwrap()
+            .is_numeric()
+        {
+            let addr_as_binstr =
+                format!("{:b}", instruction.symbol.unwrap().parse::<u16>().unwrap());
+            let mut final_addr_binstr = addr_as_binstr.to_owned();
+            // Pad the ouput with enough zeros to "become" a 16-bit word.
+            for _ in 0..(16 - addr_as_binstr.len()) {
+                final_addr_binstr.insert(0, '0');
+            }
+            final_addr_binstr
+        } else {
+            // We're not numeric, so we're some sort of label (eg @cat)
+            let symbol_from_table = symbol_table.get(&instruction.symbol).unwrap();
+            let addr_as_binstr = format!("{:b}", symbol_from_table.parse::<u16>().unwrap());
+            let mut final_addr_binstr = addr_as_binstr.to_owned();
+            for _ in 0..(16 - addr_as_binstr.len()) {
+                final_addr_binstr.insert(0, '0');
+            }
+            final_addr_binstr
         }
-        final_addr_binstr
-    } else if instruction.command_type == CommandKind::LCommand {
-        // Will handle later. Just have to impliment a symbol table.
-        todo!()
     } else {
         // We're a C instruction. The word is 111accccccdddjjj:
         let comp_bits = comp_map.get(&instruction.comp).unwrap();
@@ -340,9 +346,30 @@ fn translate(instruction: ParsedLine) -> String {
     }
 }
 
-/// Write the supplied string to the file "filename".
-// filename can be any string
-// to_write can by any type that implements the lines() function.
+fn populate_symbol_table(
+    label: ParsedLine,
+    mut table: HashMap<Option<String>, String>,
+    last_address: isize,
+) -> (HashMap<Option<String>, String>, isize) {
+    // Takes a command and writes the label to the first free address in memory.
+    // The Hack language uses 0-15 as pre-set symbols; any other command will be allocated at 16 or higher until we
+    // hit the screen address - 1, at which point we're out of space.
+    // Unless the label is a loop declaration (XXX), which needs to be mapped to the line number it occurs on.
+
+    let mut address_to_assign = last_address;
+    if table.contains_key(&label.symbol) && label.command_type != CommandKind::LCommand {
+        (table, last_address)
+    } else {
+        if label.command_type == CommandKind::LCommand {
+            table.insert(label.symbol, label.line_number.to_string());
+        } else {
+            address_to_assign = last_address + 1;
+            table.insert(label.symbol, address_to_assign.to_string());
+        }
+        (table, address_to_assign)
+    }
+}
+
 fn write_binary_to_file(filename: String, to_write: String) -> std::io::Result<()> {
     let mut output_file = File::create(filename)?;
     for line in to_write.lines() {
@@ -350,6 +377,130 @@ fn write_binary_to_file(filename: String, to_write: String) -> std::io::Result<(
         output_file.write(properly_formatted_line.as_bytes())?;
     }
     Ok(())
+}
+
+fn first_pass(
+    contents: String,
+    mut symbol_table: HashMap<Option<String>, String>,
+) -> HashMap<Option<String>, String> {
+    /* Set everything up to populate the symbol table with proper values.
+    This function iterates through each line, calls the parser, and if it finds an ACommand or LCommand, we send that
+    line to the populate_symbol_table function. The only difference in how those commands are treated here is that we
+    must decrement the line_number of the LCommand so that the next line number is correct.
+    This is done because LCommands are not a "line" in the output of the assembler, so the Acommand that jumps to where
+    the loop was will instead point to the line of the command immediately underneath the loop declaration.
+    0 (INFLOOP)         --becomes-->           0 @0
+    1 @INFLOOP                                 1 0;JMP
+    2 0;JMP
+    */
+
+    // TODO: return a tuple (HashMap, ParsedLines) so we don't have to parse the contents again in pass two.
+
+    // start at -1 because we increment first, then parse (because of how expressions are returned)
+    // This is the first loop, where we only populate (XXX) symbols into the table
+    let mut line_number = -1;
+    let mut last_ram_address: isize = 15;
+    for line in contents.lines() {
+        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
+        let parsed_line = match preprocess_line(line.to_string()) {
+            Some(instr) => {
+                line_number += 1;
+                parse_line(instr, line_number)
+            }
+            None => ParsedLine {
+                command_type: CommandKind::ICommand,
+                dest: None,
+                symbol: None,
+                comp: None,
+                jump: None,
+                line_number: 0,
+            },
+        };
+        if parsed_line.command_type != CommandKind::ICommand {
+            if parsed_line.to_owned().command_type == CommandKind::LCommand {
+                let (symbol_table_destr, last_addr) =
+                    populate_symbol_table(parsed_line.to_owned(), symbol_table, last_ram_address);
+                symbol_table = symbol_table_destr;
+                last_ram_address = last_addr;
+                line_number -= 1;
+            }
+        }
+    }
+    line_number = -1;
+    for line in contents.lines() {
+        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
+        let parsed_line = match preprocess_line(line.to_string()) {
+            Some(instr) => {
+                line_number += 1;
+                parse_line(instr, line_number)
+            }
+            None => ParsedLine {
+                command_type: CommandKind::ICommand,
+                dest: None,
+                symbol: None,
+                comp: None,
+                jump: None,
+                line_number: 0,
+            },
+        };
+        if parsed_line.command_type != CommandKind::ICommand {
+            if parsed_line.to_owned().command_type == CommandKind::ACommand
+                && !parsed_line
+                    .to_owned()
+                    .symbol
+                    .unwrap()
+                    .chars()
+                    .nth(0)
+                    .unwrap()
+                    .is_numeric()
+            {
+                // Handle A commands that are not an address
+                let (symbol_table_a, loop_lines_b) =
+                    populate_symbol_table(parsed_line.to_owned(), symbol_table, last_ram_address);
+                symbol_table = symbol_table_a;
+                last_ram_address = loop_lines_b;
+            }
+        }
+    }
+    symbol_table
+}
+
+fn second_pass(contents: String, symbol_table: HashMap<Option<String>, String>) -> String {
+    // Do the second pass of translating the lines
+    // TODO: Take the parsed_contents from pass 1 and iterate through the collection of them to avoid parsing each line
+    // for a second time here.
+    let mut translated_contents = String::new();
+    let mut line_number = -1;
+    for line in contents.lines() {
+        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
+        let parsed_line = match preprocess_line(line.to_string()) {
+            Some(instr) => {
+                line_number += 1;
+                parse_line(instr, line_number)
+            }
+            None => ParsedLine {
+                command_type: CommandKind::ICommand,
+                dest: None,
+                symbol: None,
+                comp: None,
+                jump: None,
+                line_number: 0,
+            },
+        };
+        if parsed_line.command_type != CommandKind::ICommand
+            && parsed_line.command_type != CommandKind::LCommand
+        {
+            if translated_contents.is_empty() {
+                translated_contents =
+                    translated_contents + translate(parsed_line, symbol_table.to_owned()).as_str();
+            } else {
+                translated_contents = translated_contents
+                    + "\n"
+                    + translate(parsed_line, symbol_table.to_owned()).as_str();
+            }
+        }
+    }
+    translated_contents
 }
 
 fn main() {
@@ -360,32 +511,40 @@ fn main() {
         Some(filename) => String::from(filename.to_str().unwrap()),
         None => panic!("We tried to get the filename from user's input, but one didn't exist!"),
     };
-    output_filename.push_str("-assembled.hack");
+    output_filename.push_str(".hack");
 
-    let mut translated_contents = String::new();
-    for line in contents.lines() {
-        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
-        let parsed_line = match preprocess_line(line.to_string()) {
-            Some(instr) => parse_line(instr),
-            None => ParsedLine {
-                command_type: CommandKind::ICommand,
-                dest: None,
-                symbol: None,
-                comp: None,
-                jump: None,
-            },
-        };
-        if parsed_line.command_type != CommandKind::ICommand {
-            // We've got a valid instruction, so translate it and send it to the buffer to be written.
-            // This "buffer" might be a long String with a bunch of \n in it, or it may actually be a WriteBuf
-            // setup_for_writing(translate(parsed_line));
-            translated_contents = if translated_contents.is_empty() {
-                translated_contents + translate(parsed_line).as_str()
-            } else {
-                translated_contents + "\n" + translate(parsed_line).as_str()
-            }
-        }
-    }
+    // Set the pre-set symbols into the table
+    let mut symbol_table: HashMap<Option<String>, String> = [
+        (Some(String::from("SP")), String::from("0")),
+        (Some(String::from("R0")), String::from("0")),
+        (Some(String::from("LCL")), String::from("1")),
+        (Some(String::from("R1")), String::from("1")),
+        (Some(String::from("ARG")), String::from("2")),
+        (Some(String::from("R2")), String::from("2")),
+        (Some(String::from("THIS")), String::from("3")),
+        (Some(String::from("R3")), String::from("3")),
+        (Some(String::from("THAT")), String::from("4")),
+        (Some(String::from("R4")), String::from("4")),
+        (Some(String::from("R5")), String::from("5")),
+        (Some(String::from("R6")), String::from("6")),
+        (Some(String::from("R7")), String::from("7")),
+        (Some(String::from("R8")), String::from("8")),
+        (Some(String::from("R9")), String::from("9")),
+        (Some(String::from("R10")), String::from("10")),
+        (Some(String::from("R11")), String::from("11")),
+        (Some(String::from("R12")), String::from("12")),
+        (Some(String::from("R13")), String::from("13")),
+        (Some(String::from("R14")), String::from("14")),
+        (Some(String::from("R15")), String::from("15")),
+        (Some(String::from("SCREEN")), String::from("16384")),
+        (Some(String::from("KBD")), String::from("24576")),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    symbol_table = first_pass(contents.to_owned(), symbol_table.to_owned());
+
+    let translated_contents = second_pass(contents.to_owned(), symbol_table.to_owned()).to_string();
 
     match write_binary_to_file(output_filename, translated_contents.to_owned()) {
         Ok(_) => (),
