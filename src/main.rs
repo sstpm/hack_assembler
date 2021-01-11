@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::Write, path::PathBuf};
+use std::{collections::HashMap, convert::TryInto, fs::File, io::Write, path::PathBuf};
 use structopt::StructOpt;
 
 /* A minimal assembler for the Hack computer from Nand2Tetris.
@@ -185,7 +185,7 @@ fn parse_line(line: String, line_number: isize) -> ParsedLine {
         dest: des,
         comp: com,
         jump: jmp,
-        line_number: line_number,
+        line_number,
     }
 }
 
@@ -235,6 +235,24 @@ fn preprocess_line(line: String) -> Option<String> {
             Some(potential_instruction)
         }
     }
+}
+
+fn parse_each_line(contents: String) -> Vec<ParsedLine> {
+    // Parse each line and return a vector containing them all, to avoid reparsing the document later on.
+    // If we have an L_command we need to decrement the line-number
+    let mut parsed_lines: Vec<ParsedLine> = vec![];
+    let mut line_number = -1;
+    for line in contents.lines() {
+        let preproc_line = match preprocess_line(line.to_string()) {
+            Some(instr) => {line_number += 1; parse_line(instr, line_number.try_into().unwrap())},
+            None => ParsedLine {command_type: CommandKind::ICommand, symbol: None, dest: None, comp: None, jump: None, line_number: 0}
+        };
+        if preproc_line.command_type == CommandKind::LCommand {
+            line_number -= 1;
+        }
+        parsed_lines.push(preproc_line);
+    }
+    parsed_lines
 }
 
 fn translate(instruction: ParsedLine, symbol_table: HashMap<Option<String>, String>) -> String {
@@ -361,7 +379,7 @@ fn populate_symbol_table(
         (table, last_address)
     } else {
         if label.command_type == CommandKind::LCommand {
-            table.insert(label.symbol, label.line_number.to_string());
+            table.insert(label.symbol.to_owned(), label.line_number.to_string());
         } else {
             address_to_assign = last_address + 1;
             table.insert(label.symbol, address_to_assign.to_string());
@@ -380,69 +398,31 @@ fn write_binary_to_file(filename: String, to_write: String) -> std::io::Result<(
 }
 
 fn first_pass(
-    contents: String,
+    parsed_lines: Vec<ParsedLine>,
     mut symbol_table: HashMap<Option<String>, String>,
 ) -> HashMap<Option<String>, String> {
-    /* Set everything up to populate the symbol table with proper values.
-    This function iterates through each line, calls the parser, and if it finds an ACommand or LCommand, we send that
-    line to the populate_symbol_table function. The only difference in how those commands are treated here is that we
-    must decrement the line_number of the LCommand so that the next line number is correct.
-    This is done because LCommands are not a "line" in the output of the assembler, so the Acommand that jumps to where
-    the loop was will instead point to the line of the command immediately underneath the loop declaration.
-    0 (INFLOOP)         --becomes-->           0 @0
-    1 @INFLOOP                                 1 0;JMP
-    2 0;JMP
+    /* Iterate through each parsed line and populate the symbol table in two steps.
+    The two steps are needed as the first will only add LCommands, and the second does every non-numeric ACommand.
+    They cannot be done in the same loop as we do not want an ACommand that addresses a loop to be given an address
+    because that address will then be "taken", but the LCommand will overwrite the assigned address.
+    EG we don't want to give @LOOP an address as (LOOP) will overwrite it, and no other ACommand will get that address.
     */
 
-    // TODO: return a tuple (HashMap, ParsedLines) so we don't have to parse the contents again in pass two.
-
-    // start at -1 because we increment first, then parse (because of how expressions are returned)
     // This is the first loop, where we only populate (XXX) symbols into the table
-    let mut line_number = -1;
     let mut last_ram_address: isize = 15;
-    for line in contents.lines() {
-        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
-        let parsed_line = match preprocess_line(line.to_string()) {
-            Some(instr) => {
-                line_number += 1;
-                parse_line(instr, line_number)
-            }
-            None => ParsedLine {
-                command_type: CommandKind::ICommand,
-                dest: None,
-                symbol: None,
-                comp: None,
-                jump: None,
-                line_number: 0,
-            },
-        };
+    for parsed_line in &parsed_lines {
         if parsed_line.command_type != CommandKind::ICommand {
             if parsed_line.to_owned().command_type == CommandKind::LCommand {
                 let (symbol_table_destr, last_addr) =
                     populate_symbol_table(parsed_line.to_owned(), symbol_table, last_ram_address);
                 symbol_table = symbol_table_destr;
                 last_ram_address = last_addr;
-                line_number -= 1;
             }
         }
     }
-    line_number = -1;
-    for line in contents.lines() {
-        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
-        let parsed_line = match preprocess_line(line.to_string()) {
-            Some(instr) => {
-                line_number += 1;
-                parse_line(instr, line_number)
-            }
-            None => ParsedLine {
-                command_type: CommandKind::ICommand,
-                dest: None,
-                symbol: None,
-                comp: None,
-                jump: None,
-                line_number: 0,
-            },
-        };
+
+    // Handle A commands that are not an address
+    for parsed_line in &parsed_lines {
         if parsed_line.command_type != CommandKind::ICommand {
             if parsed_line.to_owned().command_type == CommandKind::ACommand
                 && !parsed_line
@@ -454,7 +434,6 @@ fn first_pass(
                     .unwrap()
                     .is_numeric()
             {
-                // Handle A commands that are not an address
                 let (symbol_table_a, loop_lines_b) =
                     populate_symbol_table(parsed_line.to_owned(), symbol_table, last_ram_address);
                 symbol_table = symbol_table_a;
@@ -465,28 +444,12 @@ fn first_pass(
     symbol_table
 }
 
-fn second_pass(contents: String, symbol_table: HashMap<Option<String>, String>) -> String {
+fn second_pass(parsed_lines: Vec<ParsedLine>, symbol_table: HashMap<Option<String>, String>) -> String {
     // Do the second pass of translating the lines
     // TODO: Take the parsed_contents from pass 1 and iterate through the collection of them to avoid parsing each line
     // for a second time here.
     let mut translated_contents = String::new();
-    let mut line_number = -1;
-    for line in contents.lines() {
-        // parsed_line is either a valid instruction or the ICommand, which we just do nothing with.
-        let parsed_line = match preprocess_line(line.to_string()) {
-            Some(instr) => {
-                line_number += 1;
-                parse_line(instr, line_number)
-            }
-            None => ParsedLine {
-                command_type: CommandKind::ICommand,
-                dest: None,
-                symbol: None,
-                comp: None,
-                jump: None,
-                line_number: 0,
-            },
-        };
+    for parsed_line in parsed_lines {
         if parsed_line.command_type != CommandKind::ICommand
             && parsed_line.command_type != CommandKind::LCommand
         {
@@ -506,6 +469,7 @@ fn second_pass(contents: String, symbol_table: HashMap<Option<String>, String>) 
 fn main() {
     let args = Cli::from_args();
     let contents = get_file_contents(&args.path);
+    let parsed_lines = parse_each_line(contents.to_owned());
 
     let mut output_filename: String = match args.path.file_stem() {
         Some(filename) => String::from(filename.to_str().unwrap()),
@@ -542,9 +506,9 @@ fn main() {
     .iter()
     .cloned()
     .collect();
-    symbol_table = first_pass(contents.to_owned(), symbol_table.to_owned());
+    symbol_table = first_pass(parsed_lines.to_owned(), symbol_table.to_owned());
 
-    let translated_contents = second_pass(contents.to_owned(), symbol_table.to_owned()).to_string();
+    let translated_contents = second_pass(parsed_lines.to_owned(), symbol_table.to_owned()).to_string();
 
     match write_binary_to_file(output_filename, translated_contents.to_owned()) {
         Ok(_) => (),
